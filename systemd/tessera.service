@@ -1,0 +1,102 @@
+[Unit]
+Description=Tessera gallery server
+Documentation=file:/opt/tessera/README.md
+# The daemon binds loopback only and the playit agent dials out to reach it,
+# but it must never be listening before the firewall is loaded: the rules in
+# Task 23 are what stop this container reaching the LAN, and a window between
+# "daemon up" and "rules applied" is a window with no egress restrictions.
+After=network-online.target nftables.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# A dedicated unprivileged account, created by container-provision.sh. The
+# daemon binds a high port on loopback, so there is no capability to grant.
+User=tessera
+Group=tessera
+
+# /var/lib/tessera, 0700, owned tessera:tessera. Holds tessera.db and the
+# blobs/ tree. ProtectSystem=strict makes everything else read-only, so this
+# is the only writable path the process has — which is the intent: an upload
+# handler that could write outside here would be a far larger problem than a
+# full disk.
+StateDirectory=tessera
+StateDirectoryMode=0700
+
+ExecStart=/opt/tessera/bin/tessera --config /etc/tessera/tessera.toml
+
+Restart=on-failure
+RestartSec=2s
+
+# ---- sandbox ------------------------------------------------------------
+# Baseline copied from Blocksmith's bsgate.service, for the same reason: this
+# process parses attacker-controlled bytes on its first instruction. The one
+# deliberate difference is documented at MemoryDenyWriteExecute below.
+
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateIPC=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+UMask=0077
+
+# TCP on loopback (to the playit agent), plus AF_UNIX for what the Python
+# runtime opens internally. No raw sockets, no netlink, no bluetooth.
+RestrictAddressFamilies=AF_INET AF_UNIX
+
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete @mount @debug @cpu-emulation @swap
+
+# --- MemoryDenyWriteExecute ---------------------------------------------
+# MEASURED: <fill in from Task 22 Step 5 — the exact command and the exact
+#           result, or this file's own test stays red>
+#
+# The concern is specific. This daemon loads libhydrogen.so through ctypes,
+# and ctypes builds callback trampolines with libffi. On some builds libffi
+# allocates a page, writes machine code into it, and then executes it —
+# exactly the sequence MDWE exists to forbid. Whether that path is taken
+# depends on the libffi build in Debian's python3 and on whether any ctypes
+# CFUNCTYPE callback is ever created. This service creates none: it only calls
+# INTO C, never back out. So it should be fine — and "should" is not a thing
+# to ship a start-up failure on.
+#
+# Step 5 of Task 22 runs the daemon under this unit on the real container with
+# the setting ON, and records above what actually happened. Do NOT uncomment
+# this line before that measurement exists.
+# MemoryDenyWriteExecute=yes
+
+# NOTE: PrivateUsers is deliberately NOT set. It needs a nested user
+# namespace, which requires `features: nesting=1` on the LXC — a strictly
+# larger container attack surface than the setting buys back. Everything above
+# works in an unprivileged container without nesting.
+
+# Bounded so a leak or a flood cannot take the host down with it. Python's
+# floor is higher than a C daemon's: the interpreter plus sqlite3 is roughly
+# 25-30 MB resident before this service does anything of its own. 192M is
+# headroom over that, not a tight fit. Confirm the real figure in Step 5 with
+# `systemctl show tessera -p MemoryCurrent` under load and adjust.
+MemoryMax=192M
+TasksMax=16
+LimitNOFILE=256
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,79 @@
+[Unit]
+Description=playit.gg tunnel agent for Tessera
+Documentation=https://playit.gg/
+# The firewall must be loaded before this dials out, or there is a window in
+# which the tunnel is up and the rules are not. tessera.service is ordered
+# before it too — a tunnel pointing at a port nothing is listening on just
+# produces connection-refused for every visitor.
+After=network-online.target nftables.service tessera.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# The account name is load-bearing, not cosmetic. install/nftables.conf's ONLY
+# outbound allowance for the tunnel is:
+#     meta skuid "playit" tcp dport { 443, 5525 } accept
+# so renaming this user silently kills the tunnel, with no error anywhere but a
+# connect timeout. Do not change it without changing the ruleset.
+User=playit
+Group=playit
+
+# /var/lib/playit, 0700. Holds playit.toml, which contains the agent secret
+# produced by the one-time browser claim. That is a credential: it stays in a
+# 0600 file owned by this user, never inline in this unit (world-readable in
+# /etc) and never in an Environment= line (visible in `systemctl show`).
+StateDirectory=playit
+StateDirectoryMode=0700
+
+ExecStart=/usr/local/bin/playit --secret_path /var/lib/playit/playit.toml
+
+Restart=always
+RestartSec=5s
+
+# ---- sandbox ------------------------------------------------------------
+# Lighter than tessera.service on purpose: this is a third-party binary this
+# repo does not build, so the settings below are the ones that hold without
+# knowing its internals. No capabilities, no writable filesystem outside its
+# own state directory, no path to privilege.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+UMask=0077
+
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# NOT set here, and the difference from tessera.service is deliberate:
+#   * MemoryDenyWriteExecute — unknown whether this Rust binary's runtime needs
+#     W|X pages. Asserting it without measuring would be exactly the guess
+#     Task 22 refused to make about our own daemon.
+#   * SystemCallFilter=@system-service — a foreign binary's syscall set has not
+#     been enumerated, and a filter that kills it on a rare path is worse than
+#     no filter because it fails minutes or days later.
+# Both become candidates once the agent has run on the real node long enough
+# for `systemd-analyze security playit.service` and a journal check to mean
+# something. Recorded so the omission reads as a decision, not an oversight.
+
+MemoryMax=128M
+TasksMax=32
+LimitNOFILE=1024
+
+[Install]
+WantedBy=multi-user.target

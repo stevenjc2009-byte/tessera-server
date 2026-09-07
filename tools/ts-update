@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+#
+# Update Tessera in place. Runs inside the container, as root.
+#
+#   ts-update            update to the newest v*.*.* tag
+#   ts-update --check    say what would happen, change nothing
+#   ts-update --tag v1.2.0
+#   ts-update --force    reinstall even if already on the newest tag
+#
+# Shape follows Blocksmith's bs-update, including two of its hard-won details:
+#
+#   * The origin URL is PINNED here, not read from git config. An updater that
+#     trusts whatever `origin` points at can be redirected by anyone who can
+#     write .git/config.
+#   * `git fetch --tags --force --prune`. Plain `--tags` will NOT update a tag
+#     that moved, and a force-pushed tag left Blocksmith's deployed updaters
+#     rebuilding an old commit forever while reporting success.
+set -euo pipefail
+
+REPO_URL=https://github.com/stevenjc2009-byte/tessera-server
+SRC=/usr/local/src/tessera-server
+PREFIX=/opt/tessera
+UNIT=/etc/systemd/system/tessera.service
+
+CHECK_ONLY=0
+FORCE=0
+WANT_TAG=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --check) CHECK_ONLY=1; shift ;;
+        --force) FORCE=1; shift ;;
+        --tag) WANT_TAG="$2"; shift 2 ;;
+        -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+        *) printf 'unknown option: %s\n' "$1" >&2; exit 2 ;;
+    esac
+done
+
+step() { printf '\n=== %s\n' "$1"; }
+die()  { printf '\nFATAL: %s\n' "$1" >&2; exit 1; }
+
+check_origin() {
+    local actual
+    actual=$(git -C "$SRC" remote get-url origin 2>/dev/null || echo "")
+    case "$actual" in
+        "$REPO_URL"|"$REPO_URL.git") return 0 ;;
+        *) die "origin is '$actual', expected '$REPO_URL'.
+Refusing to fetch from an unexpected remote. Fix with:
+  git -C $SRC remote set-url origin $REPO_URL" ;;
+    esac
+}
+
+ensure_git_checkout() {
+    # The installer pushes a tarball, not a clone, so the first update has to
+    # convert the directory into a real checkout. The existing tree is kept —
+    # /etc and /var/lib are elsewhere, but a half-deleted source tree during
+    # an update is still a bad place to be interrupted.
+    if [ -d "$SRC/.git" ]; then
+        check_origin
+        return
+    fi
+    step "converting $SRC into a git checkout"
+    git -C "$SRC" init -q
+    git -C "$SRC" remote add origin "$REPO_URL"
+}
+
+step "fetching"
+[ -d "$SRC" ] || die "$SRC does not exist — was this container provisioned?"
+ensure_git_checkout
+# --force matters: without it a moved tag is silently ignored and this updater
+# rebuilds the same commit forever. --prune drops tags deleted upstream.
+git -C "$SRC" fetch --tags --force --prune origin
+
+CURRENT=$(git -C "$SRC" describe --tags --exact-match 2>/dev/null || echo "none")
+if [ -n "$WANT_TAG" ]; then
+    TARGET="$WANT_TAG"
+else
+    TARGET=$(git -C "$SRC" tag -l 'v*.*.*' | sort -V | tail -1)
+fi
+[ -n "$TARGET" ] || die "no v*.*.* tags found on origin"
+
+printf 'current: %s\ntarget:  %s\n' "$CURRENT" "$TARGET"
+
+if [ "$CURRENT" = "$TARGET" ] && [ "$FORCE" != 1 ]; then
+    printf 'already up to date\n'
+    exit 0
+fi
+if [ "$CHECK_ONLY" = 1 ]; then
+    printf '(--check: nothing changed)\n'
+    exit 0
+fi
+
+step "checking out $TARGET"
+git -C "$SRC" checkout -q --force "$TARGET"
+
+step "building and testing"
+# Everything below happens against the working tree. /opt is not touched until
+# the suite is green, so a bad release cannot take the running service with it.
+cd "$SRC"
+make deps
+make build
+if ! make test >/tmp/tessera-update-test.log 2>&1; then
+    printf '\n--- last 40 lines ---\n' >&2
+    tail -40 /tmp/tessera-update-test.log >&2
+    git -C "$SRC" checkout -q --force "$CURRENT" 2>/dev/null || true
+    die "$TARGET fails its own test suite; nothing was installed"
+fi
+grep -E '[0-9]+ passed' /tmp/tessera-update-test.log | tail -1
+make install-check
+
+# Task 22's checker, run against the unit the NEW release wants to install —
+# not the one currently in /etc. A release that drops NoNewPrivileges or adds a
+# capability would otherwise install itself with the sandbox quietly weakened
+# and nothing in the output to say so.
+bash "$SRC/install/hardening-check.sh" "$SRC/systemd/tessera.service"
+bash "$SRC/install/hardening-check.sh" "$SRC/systemd/playit.service" --profile playit
+
+step "backing up the running install"
+# The unit file too, not just the code: a release that changes the sandbox is
+# exactly the kind that fails to start, and rolling back the binary while
+# leaving the new unit in place would roll back nothing useful.
+rm -rf "$PREFIX.prev"
+cp -a "$PREFIX" "$PREFIX.prev"
+cp -a "$UNIT" "$UNIT.prev"
+printf 'backed up to %s.prev and %s.prev\n' "$PREFIX" "$UNIT"
+
+step "installing"
+# Reuses the provisioner, so install and update cannot drift apart. It is
+# idempotent and it leaves /etc/tessera/tessera.toml and /var/lib/tessera
+# alone by construction.
+bash "$SRC/install/container-provision.sh"
+
+step "verifying"
+ok=0
+for _ in $(seq 1 20); do
+    if systemctl is-active --quiet tessera; then
+        # is-active only says the process exists. Ask it a question.
+        code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/browse || echo 000)
+        if [ "$code" = "200" ]; then ok=1; break; fi
+    fi
+    sleep 1
+done
+
+if [ "$ok" != 1 ]; then
+    printf '\n!!! %s did not come back. Rolling back.\n' "$TARGET" >&2
+    journalctl -u tessera -n 40 --no-pager >&2
+    systemctl stop tessera || true
+    rm -rf "$PREFIX"
+    mv "$PREFIX.prev" "$PREFIX"
+    mv "$UNIT.prev" "$UNIT"
+    systemctl daemon-reload
+    systemctl start tessera
+    git -C "$SRC" checkout -q --force "$CURRENT" 2>/dev/null || true
+    sleep 2
+    if systemctl is-active --quiet tessera; then
+        die "rolled back to $CURRENT, which is running. $TARGET is broken."
+    fi
+    die "ROLLBACK ALSO FAILED. The service is down. journalctl -u tessera"
+fi
+
+printf '\n=== updated %s -> %s, service answering\n' "$CURRENT" "$TARGET"
+printf 'previous install kept at %s.prev\n' "$PREFIX"
