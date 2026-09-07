@@ -11,10 +11,19 @@ def readme(repo_root: Path) -> str:
     return (repo_root / "README.md").read_text(encoding="utf-8")
 
 
+# The project's own name matches the tool-name pattern below: it is the README's
+# title heading and the clone URL. It is not a CLI tool, and tools/tessera-server
+# must never exist. Excluded by name rather than by loosening the pattern, so the
+# test still fails on any OTHER tessera-* command the README invents.
+PROJECT_NAME = "tessera-server"
+
+
 def test_every_command_the_readme_names_actually_exists(readme: str, repo_root: Path) -> None:
     """A README naming a tool the repo does not ship is the cheapest kind of
     lie to write and the most annoying to discover at 2am on a console."""
-    for tool in sorted(set(re.findall(r"\b(tessera-[a-z]+|ts-update)\b", readme))):
+    named = set(re.findall(r"\b(tessera-[a-z]+|ts-update)\b", readme)) - {PROJECT_NAME}
+    assert named, "the tool-name pattern matched nothing, so this test proves nothing"
+    for tool in sorted(named):
         assert (repo_root / "tools" / tool).exists(), f"README names {tool}, which does not exist"
 
 
