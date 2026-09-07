@@ -1,0 +1,14 @@
+# Build output
+build/
+*.o
+*.d
+bin/
+
+# Vendored deps fetched at build time
+.deps/
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*~
