@@ -149,12 +149,14 @@ socket. Signature verification, rate limiting, quotas and the no-decode
 guarantee each have a negative test, and each negative test has a documented
 sabotage that must make it go red.
 
-One test is **expected to be red** on a fresh clone:
-`test_memory_deny_write_execute_records_a_measurement_not_a_guess`. It stays
-red until the `MEASURED:` line in `systemd/tessera.service` is filled in from a
-run on the real container. That is what stops `MemoryDenyWriteExecute` being
-switched on by guess against a ctypes/libffi runtime that may need `W|X` pages.
-Do not silence it; do the measurement.
+`test_memory_deny_write_execute_records_a_measurement_not_a_guess` used to be
+**expected red** on a fresh clone. It now passes: the `MEASURED:` block above
+`MemoryDenyWriteExecute` in `systemd/tessera.service` records a real run, and
+the setting is live rather than commented out. The test asserts only that a
+measurement is *written down* — it cannot tell a good measurement from a bad
+one — so if the setting is ever switched back to a guess, put the comment back
+to a placeholder and let the test go red again. What that measurement does and
+does not prove is in "What has NOT been verified" below.
 
 ## What has NOT been verified
 
@@ -174,8 +176,18 @@ following can only be proven on the real Proxmox node, and none of it has been:
   request is the real test.
 - **systemd sandbox enforcement in an unprivileged LXC with nesting off.**
   `systemd-analyze security` scores the unit; it does not prove the kernel
-  applies the restrictions inside that container. `MemoryDenyWriteExecute`
-  ships commented out for the reason above.
+  applies the restrictions inside that container. `MemoryDenyWriteExecute=yes`
+  now ships live rather than commented out, but read what is behind it: the
+  measurement was taken on **WSL2** — kernel `6.18.33.2-microsoft-standard-WSL2`,
+  systemd 259 — as a transient `systemd-run --user` service, **not on the
+  Proxmox LXC**. It was a real kernel and a real seccomp filter, and the run
+  carried a red arm that proves the filter was actually loaded (a raw
+  `mmap(PROT_READ|PROT_WRITE|PROT_EXEC)` through the same harness was refused
+  with `EACCES`). It is still a different kernel: the LXC could carry a
+  different libffi build, or a seccomp setup that makes systemd refuse to apply
+  the filter at all, and either would surface as a start-up failure on the node
+  and nowhere else. `install/hardening-check.sh` run on the node is what closes
+  that gap. It has not been run.
 - **nftables actually filtering.** `nft -c` proves the ruleset parses and
   `nftables-check.sh --live` proves it loaded in the right order. Only traffic
   proves it filters. The RFC1918 drops in particular have never been verified

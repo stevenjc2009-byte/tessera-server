@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import signal
 import sys
+import threading
 from pathlib import Path
 from types import FrameType
 
@@ -34,8 +35,22 @@ def main(argv: list[str] | None = None) -> int:
     server = make_server(app)
 
     def shutdown(signum: int, _frame: FrameType | None) -> None:
+        # BaseServer.shutdown() blocks until serve_forever's loop acknowledges
+        # it. A Python signal handler runs on the main thread — the same thread
+        # that is inside serve_forever — so calling it here waits for a loop
+        # that cannot make progress until the handler returns: a deadlock. The
+        # daemon logged this line and then hung until SIGKILL, which under
+        # `Restart=on-failure` costs TimeoutStopSec (90s, the default, since
+        # the unit does not set it) on every single stop and restart.
+        #
+        # So the blocking call goes on a thread of its own and the handler
+        # returns immediately; serve_forever then unwinds into the finally
+        # below. The alternative — a flag the main loop checks — would mean
+        # replacing serve_forever with a hand-written handle_request loop,
+        # which is a larger change than the bug warrants.
         print(f"received signal {signum}, shutting down", flush=True)
-        server.shutdown()
+        threading.Thread(target=server.shutdown, name="tessera-shutdown",
+                         daemon=True).start()
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
