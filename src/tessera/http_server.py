@@ -437,6 +437,6 @@ def make_server(app: TesseraApp) -> TesseraServer:
     # Importing the handler modules is what populates ROUTES. Done here, at
     # the one place a server is constructed, so no module has to be imported
     # for its side effects anywhere else.
-    from . import handlers_content  # noqa: F401
+    from . import handlers_admin, handlers_content, handlers_social  # noqa: F401
 
     return TesseraServer((app.cfg.listen_host, app.cfg.listen_port), app)

@@ -161,3 +161,40 @@ def test_rows_come_back_as_mappings(conn: sqlite3.Connection) -> None:
     row = conn.execute("SELECT title, kind FROM models").fetchone()
     assert row["title"] == "A hexagon"
     assert row["kind"] == "model"
+
+
+def test_the_admin_log_survives_deleting_the_model_it_refers_to(tmp_path) -> None:
+    conn = connect(tmp_path / "t.db")
+    migrate(conn)
+    conn.execute(
+        "INSERT INTO models (model_hash, thumb_hash, title, author_key, kind,"
+        " model_bytes, thumb_bytes, created_at)"
+        " VALUES (?, ?, 't', 'k', 'model', 1, 1, 0)", ("a" * 64, "b" * 64),
+    )
+    conn.execute(
+        "INSERT INTO admin_log (model_id, admin_key, action, reason, created_at)"
+        " VALUES (1, 'admin', 'delete', 'why', 1)"
+    )
+    conn.execute("DELETE FROM models WHERE id = 1")
+    assert conn.execute("SELECT COUNT(*) FROM admin_log").fetchone()[0] == 1
+    conn.close()
+
+
+def test_migrate_is_idempotent_and_records_the_current_version(tmp_path) -> None:
+    # Deviation from the plan: the plan's literal query is
+    # "SELECT value FROM schema_meta WHERE key = 'schema_version'", but the
+    # real schema_meta table (defined earlier in this same file's
+    # test_migrate_is_idempotent, and in db.py) uses columns k/v, not
+    # key/value. Corrected to match the real schema.
+    path = tmp_path / "t.db"
+    conn = connect(path)
+    migrate(conn)
+    migrate(conn)
+    conn.close()
+    conn = connect(path)
+    migrate(conn)
+    stored = conn.execute(
+        "SELECT v FROM schema_meta WHERE k = 'schema_version'"
+    ).fetchone()[0]
+    conn.close()
+    assert stored == str(SCHEMA_VERSION)

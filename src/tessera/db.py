@@ -20,7 +20,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -91,6 +91,19 @@ CREATE TABLE IF NOT EXISTS nonces (
     PRIMARY KEY (key, nonce)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_nonces_expiry ON nonces(expires_at);
+
+-- Every moderation action, append-only. Nothing reads this at runtime; it
+-- exists so a decision can be explained months later, and so a compromised
+-- admin key leaves a trail. Deliberately NO foreign key on model_id: the
+-- record of deleting something must outlive the thing it deleted.
+CREATE TABLE IF NOT EXISTS admin_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_id   INTEGER NOT NULL,
+    admin_key  TEXT    NOT NULL,
+    action     TEXT    NOT NULL,
+    reason     TEXT    NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+);
 """
 
 

@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Generate keypairs and manage the admin key list.
+
+`new` produces a keypair with the same libhydrogen the daemon verifies with,
+so a key made here is guaranteed to be one the daemon accepts — there is no
+second implementation that could disagree.
+
+`admin-add` rewrites the admin_keys line of the config file in place, and
+exactly that one line. This file holds hand-edited settings; a tool that
+reformatted it would eventually throw one of them away.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from tessera.config import load_config  # noqa: E402
+from tessera.hydro import Hydro  # noqa: E402
+
+KEY_RE = re.compile(r"^[0-9a-f]{64}$")
+ADMIN_LINE_RE = re.compile(r"^admin_keys\s*=.*$", re.MULTILINE)
+
+
+def write_admin_keys(config_path: Path, keys: list[str]) -> None:
+    """Replace (or append) the admin_keys line, touching nothing else.
+
+    Written to a temp file and renamed, so a crash mid-write cannot leave the
+    daemon with a config file it refuses to parse on its next restart.
+    """
+    rendered = "admin_keys = [" + ", ".join(f'"{key}"' for key in keys) + "]"
+    text = config_path.read_text(encoding="utf-8")
+    if ADMIN_LINE_RE.search(text):
+        text = ADMIN_LINE_RE.sub(rendered, text, count=1)
+    else:
+        text = text.rstrip("\n") + "\n" + rendered + "\n"
+    tmp = config_path.with_name(config_path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(config_path)
+
+
+def cmd_new(cfg, args) -> int:
+    hydro = Hydro(cfg.hydro_library)
+    public_key, secret_key = hydro.keygen()
+    print(json.dumps({"public_key": public_key.hex(), "secret_key": secret_key.hex()}, indent=2))
+    print("\nkeep the secret key — it is not recoverable and is not stored here.",
+          file=sys.stderr)
+    return 0
+
+
+def cmd_show(cfg, args) -> int:
+    keys = list(cfg.admin_keys)
+    if not keys:
+        print("no admin keys configured — /admin/* is unreachable over HTTP")
+        print("use tools/tessera-reports on the box, or add a key with `admin-add`")
+        return 0
+    for key in keys:
+        print(key)
+    return 0
+
+
+def cmd_admin_add(cfg, args) -> int:
+    if not KEY_RE.match(args.key):
+        print("a key must be exactly 64 lowercase hex characters", file=sys.stderr)
+        return 1
+    keys = list(cfg.admin_keys)
+    if args.key in keys:
+        print(f"{args.key} is already an admin key")
+        return 0
+    keys.append(args.key)
+    write_admin_keys(args.config, keys)
+    print(f"added {args.key}")
+    print("restart the daemon for it to take effect: systemctl restart tessera")
+    return 0
+
+
+def cmd_admin_remove(cfg, args) -> int:
+    keys = list(cfg.admin_keys)
+    if args.key not in keys:
+        print(f"{args.key} is not an admin key", file=sys.stderr)
+        return 1
+    keys.remove(args.key)
+    write_admin_keys(args.config, keys)
+    print(f"removed {args.key}")
+    print("restart the daemon for it to take effect: systemctl restart tessera")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Tessera keys")
+    parser.add_argument("--config", type=Path, default=Path("/etc/tessera/tessera.toml"))
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("new", help="generate a keypair")
+    sub.add_parser("show", help="list the configured admin keys")
+    add = sub.add_parser("admin-add", help="add an admin key")
+    add.add_argument("key")
+    remove = sub.add_parser("admin-remove", help="remove an admin key")
+    remove.add_argument("key")
+
+    args = parser.parse_args(argv)
+    cfg = load_config(args.config)
+    return {
+        "new": cmd_new, "show": cmd_show,
+        "admin-add": cmd_admin_add, "admin-remove": cmd_admin_remove,
+    }[args.command](cfg, args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

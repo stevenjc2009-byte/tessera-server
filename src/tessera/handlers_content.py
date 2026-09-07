@@ -175,14 +175,3 @@ def handle_model(app: TesseraApp, ctx: RequestContext, params: dict[str, str]) -
 def handle_thumb(app: TesseraApp, ctx: RequestContext, params: dict[str, str]) -> Response:
     return _serve_blob(app, params["model_id"], "thumb_hash")
 
-
-@signed_route("POST", r"/vote")
-def handle_vote_placeholder(app, ctx, params):
-    """Replaced by handlers_social.handle_vote in Task 16."""
-    return json_response(200, {"ok": True, "key": ctx.identity.key_hex})
-
-
-@signed_route("GET", r"/admin/reports", admin=True)
-def handle_admin_reports_placeholder(app, ctx, params):
-    """Replaced by handlers_admin.handle_admin_reports in Task 20."""
-    return json_response(200, {"reports": []})

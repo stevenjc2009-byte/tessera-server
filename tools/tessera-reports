@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""Read and action the moderation queue from the box itself.
+
+Why this exists alongside the HTTP admin endpoints: those need a signature
+from the moderator's 3DS. This one needs an SSH session and write access to
+the database file, which is what you actually have at 3am. It writes through
+the same tessera.moderation functions the HTTP path uses, so the two cannot
+drift into disagreeing about what 'delete' means.
+
+The daemon may be running while this runs, and should be: SQLite in WAL mode
+handles a second writer, and busy_timeout covers the moment the daemon holds
+the write lock. Stopping the service first is not required and is not
+recommended — that is a gallery outage to action one report.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from tessera.config import load_config  # noqa: E402
+from tessera.db import connect, migrate  # noqa: E402
+from tessera.moderation import resolve_reports, set_visibility  # noqa: E402
+
+CLI_ADMIN_KEY = "cli"  # what lands in admin_log.admin_key for a local action
+
+_ACTION_VISIBILITY = {
+    "approve": "public", "unlist": "unlisted", "delete": "deleted", "ban": "deleted",
+}
+
+
+def safe(text: str) -> str:
+    """Strip anything a terminal would interpret rather than print.
+
+    Report details and titles are attacker-controlled and land directly on a
+    moderator's screen. The API refuses control characters on the way in
+    (handlers_social._clean_detail); this is the second of two independent
+    guards, and the one that still holds for rows written before that check
+    existed. Replaced with '?' rather than dropped, so the moderator can see
+    that something was there.
+    """
+    return "".join(char if (0x20 <= ord(char) < 0x7F or char == "\t") else "?" for char in text)
+
+
+def queue_rows(conn, resolved: bool):
+    clause = "r.resolved_at IS NOT NULL" if resolved else "r.resolved_at IS NULL"
+    return conn.execute(
+        "SELECT r.model_id AS model_id, m.title AS title, m.author_key AS author_key,"
+        "       m.visibility AS visibility,"
+        "       COUNT(DISTINCT r.reporter_key) AS report_count,"
+        "       GROUP_CONCAT(DISTINCT r.reason) AS reasons_csv,"
+        "       MAX(r.created_at) AS last_report_at"
+        " FROM reports r JOIN models m ON m.id = r.model_id"
+        f" WHERE {clause} GROUP BY r.model_id"
+        " ORDER BY report_count DESC, last_report_at DESC"
+    ).fetchall()
+
+
+def cmd_list(conn, args) -> int:
+    rows = queue_rows(conn, resolved=args.resolved)
+
+    if args.json:
+        print(json.dumps([
+            {
+                "model_id": row["model_id"], "title": row["title"],
+                "author_key": row["author_key"], "visibility": row["visibility"],
+                "report_count": row["report_count"],
+                "reasons": sorted(p for p in (row["reasons_csv"] or "").split(",") if p),
+                "last_report_at": row["last_report_at"],
+            }
+            for row in rows
+        ], indent=2))
+        return 0
+
+    if not rows:
+        print("no open reports")
+        return 0
+
+    print(f"{'id':>6}  {'n':>3}  {'state':<9}  {'reasons':<28}  title")
+    for row in rows:
+        reasons = ",".join(sorted(p for p in (row["reasons_csv"] or "").split(",") if p))
+        print(f"{row['model_id']:>6}  {row['report_count']:>3}  {row['visibility']:<9}"
+              f"  {safe(reasons)[:28]:<28}  {safe(row['title'])[:40]}")
+    print(f"\n{len(rows)} model(s). `tessera-reports show <id>` for detail.")
+    return 0
+
+
+def cmd_show(conn, args) -> int:
+    model = conn.execute(
+        "SELECT id, title, author_key, kind, visibility, model_bytes, thumb_bytes,"
+        " created_at, score FROM models WHERE id = ?", (args.model_id,)
+    ).fetchone()
+    if model is None:
+        print(f"no model with id {args.model_id}", file=sys.stderr)
+        return 1
+
+    print(f"model    {model['id']}")
+    print(f"title    {safe(model['title'])}")
+    print(f"author   {model['author_key']}")
+    print(f"kind     {model['kind']}   visibility {model['visibility']}   score {model['score']}")
+    print(f"bytes    model={model['model_bytes']} thumb={model['thumb_bytes']}")
+    print(f"uploaded {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(model['created_at']))} UTC")
+    print("\nreports:")
+    for row in conn.execute(
+        "SELECT reporter_key, reason, detail, created_at, resolved_at FROM reports"
+        " WHERE model_id = ? ORDER BY created_at", (args.model_id,)
+    ):
+        state = "resolved" if row["resolved_at"] else "open"
+        when = time.strftime("%Y-%m-%d %H:%M", time.gmtime(row["created_at"]))
+        print(f"  [{state:<8}] {when}  {row['reason']:<8}  {row['reporter_key'][:16]}...")
+        if row["detail"]:
+            print(f"             {safe(row['detail'])}")
+    return 0
+
+
+def apply_action(conn, model_id: int, action: str, reason: str) -> int:
+    row = conn.execute("SELECT id, author_key FROM models WHERE id = ?", (model_id,)).fetchone()
+    if row is None:
+        print(f"no model with id {model_id}", file=sys.stderr)
+        return 1
+
+    now = int(time.time())
+    with conn:
+        set_visibility(conn, model_id, _ACTION_VISIBILITY[action])
+        if action != "unlist":
+            resolve_reports(conn, model_id, now)
+        if action == "ban":
+            conn.execute(
+                "INSERT INTO bans (key, reason, created_at) VALUES (?, ?, ?)"
+                " ON CONFLICT (key) DO UPDATE SET reason = excluded.reason",
+                (row["author_key"], reason, now),
+            )
+            conn.execute(
+                "UPDATE models SET visibility = 'deleted' WHERE author_key = ?",
+                (row["author_key"],),
+            )
+        conn.execute(
+            "INSERT INTO admin_log (model_id, admin_key, action, reason, created_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (model_id, CLI_ADMIN_KEY, action, reason, now),
+        )
+
+    final = conn.execute(
+        "SELECT visibility FROM models WHERE id = ?", (model_id,)
+    ).fetchone()["visibility"]
+    print(f"model {model_id}: {action} -> {final}")
+    if action == "ban":
+        print(f"banned key {row['author_key']} and deleted everything it uploaded")
+    return 0
+
+
+def cmd_unban(conn, args) -> int:
+    with conn:
+        cursor = conn.execute("DELETE FROM bans WHERE key = ?", (args.key,))
+    if cursor.rowcount == 0:
+        print(f"key {args.key} was not banned", file=sys.stderr)
+        return 1
+    print(f"unbanned {args.key}")
+    print("note: their models stay deleted. Approve any you want back, individually.")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Tessera moderation queue")
+    parser.add_argument("--config", type=Path, default=Path("/etc/tessera/tessera.toml"))
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    listing = sub.add_parser("list", help="show the open queue")
+    listing.add_argument("--json", action="store_true")
+    listing.add_argument("--resolved", action="store_true", help="show closed reports instead")
+
+    show = sub.add_parser("show", help="full detail for one model")
+    show.add_argument("model_id", type=int)
+
+    for action, helptext in (
+        ("approve", "clear the reports and make it public"),
+        ("unlist", "hide it from browse, leave the reports open"),
+        ("delete", "remove it from browse and download"),
+        ("ban", "ban the author and delete everything they uploaded"),
+    ):
+        action_parser = sub.add_parser(action, help=helptext)
+        action_parser.add_argument("model_id", type=int)
+        action_parser.add_argument("--reason", default="")
+
+    unban = sub.add_parser("unban", help="lift a ban on a key")
+    unban.add_argument("key")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    cfg = load_config(args.config)
+    conn = connect(cfg.db_path)
+    conn.execute("PRAGMA busy_timeout = 5000")
+    migrate(conn)
+    try:
+        if args.command == "list":
+            return cmd_list(conn, args)
+        if args.command == "show":
+            return cmd_show(conn, args)
+        if args.command == "unban":
+            return cmd_unban(conn, args)
+        return apply_action(conn, args.model_id, args.command, args.reason)
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

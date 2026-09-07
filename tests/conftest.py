@@ -158,6 +158,7 @@ class Client:
         self.server = server
         self.hydro = hydro
         self.config = server.config
+        self.config_path = server.config_path
         self.use_ppv2 = use_ppv2
         self._nonce = 0
 
@@ -279,6 +280,19 @@ def pp_client(tmp_path: Path, state_dir: Path, hydro_library_path: Path):
     server = _start(tmp_path, state_dir, hydro_library_path,
                     {"proxy_protocol": True, "trusted_proxy_cidr": "127.0.0.0/8"})
     yield Client(server, Hydro(hydro_library_path), use_ppv2=True)
+    server.stop()
+
+
+@pytest.fixture
+def threshold_two_client(tmp_path: Path, state_dir: Path, hydro_library_path: Path):
+    """A second live server with report_autohide_threshold = 2.
+
+    A separate server rather than an edit to the shared one: the threshold is
+    read at start-up, so mutating the shared fixture's config would leak into
+    whatever test runs next.
+    """
+    server = _start(tmp_path, state_dir, hydro_library_path, {"report_autohide_threshold": 2})
+    yield Client(server, Hydro(hydro_library_path), use_ppv2=False)
     server.stop()
 
 
